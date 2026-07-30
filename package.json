@@ -1,142 +1,18 @@
-require("dotenv").config();
-const path = require("path");
-const express = require("express");
-const av = require("./airvantageClient");
-const store = require("./store");
-
-const app = express();
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "..", "public")));
-
-const handle = (fn) => async (req, res) => {
-  try {
-    const data = await fn(req);
-    res.json(data ?? {});
-  } catch (err) {
-    console.error(err);
-    res.status(err.status || 500).json({
-      error: err.message || "Unexpected error",
-      details: err.details || null,
-    });
+{
+  "name": "airvantage-alerts-console",
+  "version": "1.0.0",
+  "description": "Internal Product console for creating AirVantage Alert rules, notification hooks, and monitoring alerts — no engineering dependency required.",
+  "main": "server/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
   }
-};
-
-// ==========================================================
-// Notifications = an AirVantage alert rule + local Product
-// context (who ran it, plain-language criteria summary,
-// customers reached). This is the primary surface of the app.
-// ==========================================================
-
-// List every notification, merging local metadata with a
-// best-effort "customers reached" count pulled from AirVantage.
-app.get(
-  "/api/notifications",
-  handle(async () => {
-    const [rulesResp, campaigns] = await Promise.all([av.listAlertRules(), store.list()]);
-    const rules = Array.isArray(rulesResp) ? rulesResp : rulesResp.items || [];
-
-    const merged = await Promise.all(
-      rules.map(async (rule) => {
-        const campaign = store.getByRuleId(rule.id) || {};
-        const reached = await av.getReachedCount(rule.id, campaign.createdAt);
-        return {
-          ruleId: rule.id,
-          name: rule.name,
-          message: rule.message,
-          targetType: rule.targetType,
-          notifMode: rule.notifMode,
-          emails: rule.emails || [],
-          active: rule.active,
-          stateful: rule.stateful,
-          conditions: rule.conditions,
-          criteriaSummary: campaign.criteriaSummary || summarizeConditions(rule.conditions),
-          responsible: campaign.responsible || null,
-          createdAt: campaign.createdAt || null,
-          updatedAt: campaign.updatedAt || null,
-          reached,
-        };
-      })
-    );
-
-    // Local campaign records whose AirVantage rule no longer exists
-    // (deleted directly in AirVantage) — drop them silently.
-    const validIds = new Set(rules.map((r) => String(r.id)));
-    campaigns.filter((c) => !validIds.has(String(c.ruleId))).forEach((c) => store.remove(c.ruleId));
-
-    merged.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    res.json({ items: merged });
-  })
-);
-
-function summarizeConditions(conditions) {
-  const list = Array.isArray(conditions) ? conditions : conditions ? [conditions] : [];
-  if (!list.length) return "No conditions";
-  return list
-    .map((c) => {
-      const attr = c.operands?.[0]?.attributeId?.name || "?";
-      const val = c.operands?.[1];
-      const valText = val ? (val.valuesStr ? val.valuesStr.join("/") : val.valueStr ?? val.valueNum ?? "") : "";
-      return `${attr} ${c.operator}${valText ? " " + valText : ""}`;
-    })
-    .join(" · ");
 }
-
-// Create a new notification: creates the AirVantage rule, then records
-// who ran it and why in the local log.
-app.post(
-  "/api/notifications",
-  handle(async (req) => {
-    const { responsible, criteriaSummary, ...ruleBody } = req.body;
-    const rule = await av.createAlertRule(ruleBody);
-    store.upsert({
-      ruleId: rule.id,
-      responsible,
-      criteriaSummary: criteriaSummary || summarizeConditions(ruleBody.conditions),
-    });
-    return { id: rule.id };
-  })
-);
-
-// Update: updates the AirVantage rule and refreshes local metadata
-// (who last edited it, updated criteria summary).
-app.put(
-  "/api/notifications/:ruleId",
-  handle(async (req) => {
-    const { responsible, criteriaSummary, ...ruleBody } = req.body;
-    await av.updateAlertRule(req.params.ruleId, ruleBody);
-    store.upsert({
-      ruleId: req.params.ruleId,
-      responsible,
-      criteriaSummary: criteriaSummary || summarizeConditions(ruleBody.conditions),
-    });
-    return { ok: true };
-  })
-);
-
-app.delete(
-  "/api/notifications/:ruleId",
-  handle(async (req) => {
-    await av.deleteAlertRule(req.params.ruleId);
-    store.remove(req.params.ruleId);
-    return { ok: true };
-  })
-);
-
-// ---- Notification hooks (per rule) ----
-app.get("/api/notifications/:id/hooks", handle((req) => av.listHooks(req.params.id)));
-app.post("/api/notifications/:id/hooks", handle((req) => av.createHook(req.params.id, req.body)));
-app.delete(
-  "/api/notifications/:id/hooks/:hookId",
-  handle((req) => av.deleteHook(req.params.id, req.params.hookId))
-);
-
-// ---- Raw alert monitoring (secondary/debug views) ----
-app.get("/api/alerts/current", handle((req) => av.getCurrentAlerts(req.query)));
-app.get("/api/alerts/history", handle((req) => av.getAlertHistory(req.query)));
-
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
-
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`Alerts console running at http://localhost:${PORT}`);
-});
