@@ -1,0 +1,392 @@
+// ---- Reference data (from the AirVantage Alert API spec) ----
+const COMMON_ATTRIBUTES = [
+  "system.name", "system.labels", "system.commStatus", "system.lastCommDate",
+  "system.activityState", "system.lifeCycleState", "system.heartbeat.state",
+  "system.offerId", "offer.poolBytesLimit", "offer.poolWarnLimit",
+  "system.usage.status", "gateway.serial.number",
+];
+
+const OPERATORS = {
+  CHANGE: { arity: 0 },
+  EQUALS: { arity: 1, kind: "text" },
+  NOT_EQUALS: { arity: 1, kind: "text" },
+  GREATER_THAN: { arity: 1, kind: "number" },
+  LESS_THAN: { arity: 1, kind: "number" },
+  EXISTS: { arity: 0 },
+  NOT_EXISTS: { arity: 0 },
+  IN: { arity: 1, kind: "list" },
+  NOT_IN: { arity: 1, kind: "list" },
+  CONTAINS: { arity: 1, kind: "text" },
+  NOT_CONTAINS: { arity: 1, kind: "text" },
+  STARTS_WITH: { arity: 1, kind: "text" },
+  ENDS_WITH: { arity: 1, kind: "text" },
+  GEO_WITHIN: { arity: 1, kind: "text", hint: "POLYGON WKT" },
+  GEO_NOT_WITHIN: { arity: 1, kind: "text", hint: "POLYGON WKT" },
+  GEO_DISTANCE_TOO_FAR: { arity: 2, kind: "text", hint: "POINT WKT, then km" },
+  GEO_DISTANCE_TOO_CLOSE: { arity: 2, kind: "text", hint: "POINT WKT, then km" },
+};
+
+const NOTIF_LABELS = {
+  WHEN_STATE_CHANGES: "When state changes",
+  EVERY_TIME: "Every time",
+  WHEN_STATE_TRUE: "When true",
+  WHEN_STATE_FALSE: "When false",
+  IN_ALL_CASES: "In all cases",
+};
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+function toast(msg, isError = false) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = `toast show${isError ? " error" : ""}`;
+  setTimeout(() => (el.className = "toast"), 3200);
+}
+
+function escapeHtml(str) {
+  return String(str ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function initials(name) {
+  return (name || "?").trim().split(/\s+/).map((p) => p[0]).slice(0, 2).join("").toUpperCase();
+}
+
+// ---- View switching ----
+const views = ["notifications", "current", "history"];
+function showView(name) {
+  views.forEach((v) => document.getElementById(`view-${v}`).classList.toggle("is-hidden", v !== name));
+  document.querySelectorAll(".side-link").forEach((btn) => btn.classList.toggle("is-active", btn.dataset.view === name));
+  if (name === "current") loadCurrentAlerts();
+}
+document.querySelectorAll(".side-link").forEach((btn) => btn.addEventListener("click", () => showView(btn.dataset.view)));
+
+// ==================================================================
+// NOTIFICATIONS (rule + local campaign metadata)
+// ==================================================================
+let notifCache = [];
+
+async function loadNotifications() {
+  const body = document.getElementById("rulesBody");
+  try {
+    const data = await api("/api/notifications");
+    notifCache = data.items || [];
+    if (!notifCache.length) {
+      body.innerHTML = `<div class="db-row"><div class="empty-row">No notifications yet. Click "+ New" to run your first one.</div></div>`;
+      return;
+    }
+    body.innerHTML = notifCache.map(notificationRow).join("");
+    body.querySelectorAll("[data-edit]").forEach((row) =>
+      row.addEventListener("click", () => openRuleDrawer(row.dataset.edit))
+    );
+    document.getElementById("connDot").classList.add("is-live");
+  } catch (err) {
+    body.innerHTML = `<div class="db-row"><div class="empty-row">Couldn't load notifications — ${escapeHtml(err.message)}</div></div>`;
+    toast(err.message, true);
+  }
+}
+
+function notificationRow(n) {
+  const owner = n.responsible
+    ? `<span class="owner"><span class="avatar">${initials(n.responsible)}</span>${escapeHtml(n.responsible)}</span>`
+    : `<span class="owner" style="color:var(--text-faint)">—</span>`;
+  const sent = n.createdAt ? new Date(n.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "—";
+  const reached = n.reached === null || n.reached === undefined ? "—" : n.reached;
+  return `
+    <div class="db-row" data-edit="${n.ruleId}">
+      <div class="col col-name"><span class="name-emoji">📣</span>${escapeHtml(n.name || "Untitled")}</div>
+      <div class="col col-status"><span class="tag ${n.active ? "status-active" : "status-paused"}">${n.active ? "Active" : "Paused"}</span></div>
+      <div class="col col-reached">${reached}</div>
+      <div class="col col-owner">${owner}</div>
+      <div class="col col-date">${sent}</div>
+      <div class="col col-criteria">${escapeHtml(n.criteriaSummary || "No conditions")}</div>
+    </div>`;
+}
+
+// ---- Page panel: create/edit notification ----
+const drawerBackdrop = document.getElementById("drawerBackdrop");
+const ruleForm = document.getElementById("ruleForm");
+let currentRuleId = null;
+
+document.getElementById("newRuleBtn").addEventListener("click", () => openRuleDrawer(null));
+document.getElementById("closeDrawerBtn").addEventListener("click", closeRuleDrawer);
+drawerBackdrop.addEventListener("click", (e) => { if (e.target === drawerBackdrop) closeRuleDrawer(); });
+
+document.getElementById("f-targetType").addEventListener("change", (e) => {
+  document.getElementById("targetTypeCustomRow").style.display = e.target.value === "__custom" ? "grid" : "none";
+});
+document.getElementById("f-active").addEventListener("change", (e) => {
+  document.getElementById("statusText").textContent = e.target.checked ? "Active" : "Paused";
+});
+document.getElementById("f-stateful").addEventListener("change", (e) => {
+  document.getElementById("statefulText").textContent = e.target.checked ? "Tracks on/off" : "One-off ping";
+});
+
+function openRuleDrawer(ruleId) {
+  currentRuleId = ruleId;
+  ruleForm.reset();
+  document.getElementById("conditionsList").innerHTML = "";
+  document.getElementById("targetTypeCustomRow").style.display = "none";
+
+  const n = ruleId ? notifCache.find((x) => String(x.ruleId) === String(ruleId)) : null;
+
+  document.getElementById("crumbTitle").textContent = n ? (n.name || "Edit") : "New";
+  document.getElementById("deleteRuleBtn").style.display = n ? "inline-flex" : "none";
+  document.getElementById("manageHooksInlineBtn").style.display = n ? "inline-flex" : "none";
+  document.getElementById("ruleId").value = n?.ruleId || "";
+
+  document.getElementById("f-name").value = n?.name || "";
+  document.getElementById("f-message").value = n?.message || "";
+  document.getElementById("f-notifMode").value = n?.notifMode || "WHEN_STATE_CHANGES";
+  document.getElementById("f-stateful").checked = n ? !!n.stateful : true;
+  document.getElementById("f-active").checked = n ? !!n.active : true;
+  document.getElementById("statusText").textContent = (n ? n.active : true) ? "Active" : "Paused";
+  document.getElementById("statefulText").textContent = (n ? n.stateful : true) ? "Tracks on/off" : "One-off ping";
+  document.getElementById("f-emails").value = (n?.emails || []).join(", ");
+  document.getElementById("f-responsible").value = n?.responsible || "";
+
+  const targetSel = document.getElementById("f-targetType");
+  if (n?.targetType && n.targetType !== "SYSTEM") {
+    targetSel.value = "__custom";
+    document.getElementById("targetTypeCustomRow").style.display = "grid";
+    document.getElementById("f-targetType-custom").value = n.targetType;
+  } else {
+    targetSel.value = n?.targetType || "SYSTEM";
+  }
+
+  const conditions = n?.conditions ? (Array.isArray(n.conditions) ? n.conditions : [n.conditions]) : [];
+  if (conditions.length) conditions.forEach(addConditionRow);
+  else addConditionRow();
+
+  const reachedSection = document.getElementById("reachedSection");
+  if (n) {
+    reachedSection.style.display = "block";
+    document.getElementById("statReached").textContent = n.reached === null || n.reached === undefined ? "—" : n.reached;
+    document.getElementById("statSent").textContent = n.createdAt ? new Date(n.createdAt).toLocaleDateString() : "—";
+  } else {
+    reachedSection.style.display = "none";
+  }
+
+  document.querySelector("#ruleForm .panel-actions .btn-dark").textContent = n ? "Save changes" : "Run notification";
+  drawerBackdrop.classList.remove("is-hidden");
+}
+
+function closeRuleDrawer() {
+  drawerBackdrop.classList.add("is-hidden");
+  currentRuleId = null;
+}
+
+function addConditionRow(existing) {
+  const list = document.getElementById("conditionsList");
+  const row = document.createElement("div");
+  row.className = "condition-row";
+
+  const attrValue = existing?.operands?.[0]?.attributeId?.name || "";
+  const operator = existing?.operator || "EQUALS";
+  const valueOperand = existing?.operands?.[1];
+  let valueStr = "";
+  if (valueOperand) {
+    valueStr = valueOperand.valuesStr ? valueOperand.valuesStr.join(", ") : (valueOperand.valueStr ?? valueOperand.valueNum ?? "");
+  }
+
+  row.innerHTML = `
+    <input class="c-attr" list="attrOptions" placeholder="attribute e.g. system.commStatus" value="${escapeHtml(attrValue)}" />
+    <select class="c-op">
+      ${Object.keys(OPERATORS).map((op) => `<option value="${op}" ${op === operator ? "selected" : ""}>${op}</option>`).join("")}
+    </select>
+    <input class="c-val" placeholder="value" value="${escapeHtml(valueStr)}" />
+    <button type="button" class="condition-remove" title="Remove condition">×</button>
+  `;
+  row.querySelector(".condition-remove").addEventListener("click", () => row.remove());
+  updateValuePlaceholder(row);
+  row.querySelector(".c-op").addEventListener("change", () => updateValuePlaceholder(row));
+  list.appendChild(row);
+}
+
+function updateValuePlaceholder(row) {
+  const op = row.querySelector(".c-op").value;
+  const meta = OPERATORS[op];
+  const valInput = row.querySelector(".c-val");
+  if (!meta || meta.arity === 0) {
+    valInput.placeholder = "(no value needed)";
+    valInput.disabled = true;
+    valInput.value = "";
+  } else {
+    valInput.disabled = false;
+    valInput.placeholder = meta.hint || (meta.kind === "list" ? "comma-separated values" : "value");
+  }
+}
+
+document.getElementById("addConditionBtn").addEventListener("click", () => addConditionRow());
+
+const datalist = document.createElement("datalist");
+datalist.id = "attrOptions";
+datalist.innerHTML = COMMON_ATTRIBUTES.map((a) => `<option value="${a}">`).join("");
+document.body.appendChild(datalist);
+
+function buildConditionsPayload() {
+  return [...document.querySelectorAll(".condition-row")].map((row) => {
+    const attrName = row.querySelector(".c-attr").value.trim();
+    const operator = row.querySelector(".c-op").value;
+    const meta = OPERATORS[operator];
+    const rawVal = row.querySelector(".c-val").value.trim();
+    const operands = [{ attributeId: { name: attrName } }];
+    if (meta && meta.arity > 0 && rawVal) {
+      if (meta.kind === "list") operands.push({ valuesStr: rawVal.split(",").map((s) => s.trim()).filter(Boolean) });
+      else if (meta.kind === "number" && !isNaN(Number(rawVal))) operands.push({ valueNum: Number(rawVal) });
+      else operands.push({ valueStr: rawVal });
+    }
+    return { operator, operands };
+  });
+}
+
+ruleForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const targetTypeSel = document.getElementById("f-targetType").value;
+  const targetType = targetTypeSel === "__custom" ? document.getElementById("f-targetType-custom").value.trim() : targetTypeSel;
+
+  const payload = {
+    name: document.getElementById("f-name").value.trim(),
+    message: document.getElementById("f-message").value.trim(),
+    targetType,
+    active: document.getElementById("f-active").checked,
+    stateful: document.getElementById("f-stateful").checked,
+    notifMode: document.getElementById("f-notifMode").value,
+    emails: document.getElementById("f-emails").value.split(",").map((s) => s.trim()).filter(Boolean),
+    conditions: buildConditionsPayload(),
+    responsible: document.getElementById("f-responsible").value.trim(),
+  };
+
+  try {
+    if (currentRuleId) {
+      await api(`/api/notifications/${currentRuleId}`, { method: "PUT", body: JSON.stringify(payload) });
+      toast("Notification updated");
+    } else {
+      await api("/api/notifications", { method: "POST", body: JSON.stringify(payload) });
+      toast("Notification is live");
+    }
+    closeRuleDrawer();
+    loadNotifications();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+document.getElementById("deleteRuleBtn").addEventListener("click", async () => {
+  if (!currentRuleId) return;
+  if (!confirm("Delete this notification? This cannot be undone.")) return;
+  try {
+    await api(`/api/notifications/${currentRuleId}`, { method: "DELETE" });
+    toast("Notification deleted");
+    closeRuleDrawer();
+    loadNotifications();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+// ==================================================================
+// HOOKS
+// ==================================================================
+const hooksBackdrop = document.getElementById("hooksBackdrop");
+document.getElementById("closeHooksBtn").addEventListener("click", () => hooksBackdrop.classList.add("is-hidden"));
+hooksBackdrop.addEventListener("click", (e) => { if (e.target === hooksBackdrop) hooksBackdrop.classList.add("is-hidden"); });
+
+document.getElementById("manageHooksInlineBtn").addEventListener("click", async () => {
+  if (!currentRuleId) return;
+  hooksBackdrop.classList.remove("is-hidden");
+  await loadHooks();
+});
+
+async function loadHooks() {
+  const list = document.getElementById("hookList");
+  list.innerHTML = `<li>Loading…</li>`;
+  try {
+    const data = await api(`/api/notifications/${currentRuleId}/hooks`);
+    const hooks = Array.isArray(data) ? data : data.items || [];
+    if (!hooks.length) {
+      list.innerHTML = `<li>No webhooks configured for this rule.</li>`;
+      return;
+    }
+    list.innerHTML = hooks.map((h) => `
+      <li><span>${escapeHtml(h.callback)}</span><button class="condition-remove" data-hook="${h.uid}" title="Remove">×</button></li>`).join("");
+    list.querySelectorAll("[data-hook]").forEach((btn) =>
+      btn.addEventListener("click", async () => {
+        try {
+          await api(`/api/notifications/${currentRuleId}/hooks/${btn.dataset.hook}`, { method: "DELETE" });
+          toast("Webhook removed");
+          loadHooks();
+        } catch (err) { toast(err.message, true); }
+      })
+    );
+  } catch (err) {
+    list.innerHTML = `<li>${escapeHtml(err.message)}</li>`;
+  }
+}
+
+document.getElementById("hookForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const url = document.getElementById("f-hookUrl").value.trim();
+  try {
+    await api(`/api/notifications/${currentRuleId}/hooks`, { method: "POST", body: JSON.stringify({ callback: url }) });
+    document.getElementById("f-hookUrl").value = "";
+    toast("Webhook added");
+    loadHooks();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+// ==================================================================
+// LIVE STATUS + RAW HISTORY (secondary/debug views)
+// ==================================================================
+function alertRow(a, ts) {
+  return `
+    <div class="db-row">
+      <div class="col-name mono" style="font-family:var(--mono);font-size:12.5px;">${escapeHtml(a.targetId)} <span style="color:var(--text-faint)">· rule ${escapeHtml(a.ruleId)}</span></div>
+      <div><span class="tag ${a.state ? "true" : "false"}">${a.state ? "TRUE" : "FALSE"}</span></div>
+      <div class="col-date">${ts ? new Date(ts).toLocaleString() : "—"}</div>
+    </div>`;
+}
+
+async function loadCurrentAlerts() {
+  const body = document.getElementById("currentBody");
+  body.innerHTML = `<div class="db-row"><div class="empty-row">Loading…</div></div>`;
+  try {
+    const data = await api("/api/alerts/current");
+    const items = data.items || [];
+    if (!items.length) {
+      body.innerHTML = `<div class="db-row"><div class="empty-row">No active alerts.</div></div>`;
+      return;
+    }
+    body.innerHTML = items.map((a) => alertRow(a, a.stateChangeTs)).join("");
+  } catch (err) {
+    body.innerHTML = `<div class="db-row"><div class="empty-row">${escapeHtml(err.message)}</div></div>`;
+  }
+}
+document.getElementById("refreshCurrentBtn").addEventListener("click", loadCurrentAlerts);
+
+document.getElementById("historyForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const from = document.getElementById("historyFrom").value;
+  const to = document.getElementById("historyTo").value;
+  const body = document.getElementById("historyBody");
+  body.innerHTML = `<div class="db-row"><div class="empty-row">Loading…</div></div>`;
+  try {
+    const data = await api(`/api/alerts/history?from=${new Date(from).getTime()}&to=${new Date(to).getTime()}`);
+    const items = data.items || [];
+    if (!items.length) {
+      body.innerHTML = `<div class="db-row"><div class="empty-row">No alerts in that range.</div></div>`;
+      return;
+    }
+    body.innerHTML = items.map((a) => alertRow(a, a.ts)).join("");
+  } catch (err) {
+    body.innerHTML = `<div class="db-row"><div class="empty-row">${escapeHtml(err.message)}</div></div>`;
+  }
+});
+
+// ---- init ----
+loadNotifications();
